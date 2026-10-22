@@ -3,10 +3,13 @@ import { NextRequest, NextResponse } from "next/server";
 import type { ResultSetHeader, RowDataPacket } from "mysql2";
 
 import pool from "@/lib/mysql";
+import { getSession } from "@/lib/auth/session";
 import { requirePermission } from "@/lib/auth/permissions";
+import { recordActivity } from "@/lib/activity-log";
 
 interface AllocationRow extends RowDataPacket {
   Allocation_ID: number;
+  Request_ID: number;
   Center_ID: number;
   Disaster_ID: number;
   Allocation_Status: string;
@@ -45,13 +48,21 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Admin and Coordinator can record distributions.
   const authorizationError = await requirePermission(
     "record_distribution"
   );
 
   if (authorizationError) {
     return authorizationError;
+  }
+
+  const session = await getSession();
+
+  if (!session) {
+    return NextResponse.json(
+      { error: "Please sign in." },
+      { status: 401 }
+    );
   }
 
   let body: unknown;
@@ -73,14 +84,10 @@ export async function POST(request: NextRequest) {
   }
 
   const data = body as Record<string, unknown>;
-
   const allocationId = data.allocation_id;
   const beneficiaryId = data.beneficiary_id;
 
-  if (
-    !validId(allocationId) ||
-    !validId(beneficiaryId)
-  ) {
+  if (!validId(allocationId) || !validId(beneficiaryId)) {
     return NextResponse.json(
       { error: "Enter valid allocation and beneficiary IDs." },
       { status: 400 }
@@ -143,19 +150,19 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // Check resources in a consistent order.
   items.sort((a, b) => a.resource_id - b.resource_id);
 
   let connection;
+  let transactionCommitted = false;
 
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // Lock the allocation to serialize distribution submissions.
     const [allocations] = await connection.query<AllocationRow[]>(
       `SELECT
          A.Allocation_ID,
+         A.Request_ID,
          A.Allocation_Status,
          AR.Center_ID,
          AR.Disaster_ID
@@ -193,8 +200,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Verify that the beneficiary belongs to the same
-    // relief center and disaster as the allocation request.
     const [beneficiaries] =
       await connection.query<BeneficiaryRow[]>(
         `SELECT
@@ -232,8 +237,6 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Verify that the total distributed amount cannot
-    // exceed the approved allocation.
     for (const item of items) {
       const [quantities] = await connection.query<QuantityRow[]>(
         `SELECT
@@ -290,7 +293,6 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Create the distribution header.
     const [distributionResult] =
       await connection.execute<ResultSetHeader>(
         `INSERT INTO Distribution
@@ -301,7 +303,6 @@ export async function POST(request: NextRequest) {
 
     const distributionId = distributionResult.insertId;
 
-    // Insert the distributed resource quantities.
     for (const item of items) {
       await connection.execute(
         `INSERT INTO Distribution_Item
@@ -319,9 +320,20 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Inventory is NOT deducted here:
-    // it was already deducted during allocation.
+    // The inventory was already deducted during allocation.
     await connection.commit();
+    transactionCommitted = true;
+
+    const logged = await recordActivity({
+      action: "DISTRIBUTION_RECORDED",
+      request_id: allocation.Request_ID,
+      disaster_id: allocation.Disaster_ID,
+      performed_by: session.username,
+      description:
+        `Distribution #${distributionId} recorded for ` +
+        `Allocation #${allocationId}, Beneficiary #${beneficiaryId}.`,
+      status: "Success",
+    });
 
     return NextResponse.json(
       {
@@ -330,11 +342,12 @@ export async function POST(request: NextRequest) {
         allocation_id: allocationId,
         beneficiary_id: beneficiaryId,
         distributed_items: items,
+        activity_logged: logged,
       },
       { status: 201 }
     );
   } catch (error) {
-    if (connection) {
+    if (connection && !transactionCommitted) {
       try {
         await connection.rollback();
       } catch (rollbackError) {

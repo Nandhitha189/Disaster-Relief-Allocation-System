@@ -7,12 +7,12 @@ import Link from "next/link";
 type ActivityLog = {
   _id: string;
   action: string;
-  request_id: number;
-  disaster_id: number;
+  request_id?: number | null;
+  disaster_id?: number | null;
   performed_by: string;
   description: string;
   status: string;
-  timestamp: string;
+  timestamp?: string | null;
 };
 
 export default function ActivityLogsPage() {
@@ -23,17 +23,20 @@ export default function ActivityLogsPage() {
   useEffect(() => {
     async function fetchLogs() {
       try {
-        const response = await fetch("/api/activity-logs");
+        const response = await fetch("/api/activity-logs", {
+          cache: "no-store",
+        });
 
         if (!response.ok) {
-          throw new Error("Unable to load activity logs");
+          throw new Error("Unable to load activity logs.");
         }
 
         const data: ActivityLog[] = await response.json();
+
         setLogs(data);
       } catch (err) {
         setError(
-          err instanceof Error ? err.message : "Unknown error"
+          err instanceof Error ? err.message : "Unknown error."
         );
       } finally {
         setLoading(false);
@@ -51,10 +54,29 @@ export default function ActivityLogsPage() {
     (log) => log.status.toLowerCase() === "partial"
   ).length;
 
+  function formatTimestamp(value?: string | null) {
+    if (!value) return "N/A";
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+      return "N/A";
+    }
+
+    return date.toLocaleString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      dateStyle: "medium",
+      timeStyle: "medium",
+    });
+  }
+
   return (
     <main className="min-h-screen bg-gray-50 p-6 text-gray-900">
       <div className="mx-auto max-w-7xl">
-        <Link href="/" className="text-blue-600 hover:underline">
+        <Link
+          href="/"
+          className="text-blue-600 hover:underline"
+        >
           ← Back to Dashboard
         </Link>
 
@@ -63,7 +85,7 @@ export default function ActivityLogsPage() {
         </h1>
 
         <p className="mt-2 text-gray-600">
-          Allocation activities and operation history from MongoDB Atlas.
+          Operational activities recorded in MongoDB Atlas.
         </p>
 
         {loading && (
@@ -71,7 +93,9 @@ export default function ActivityLogsPage() {
         )}
 
         {error && (
-          <p className="mt-8 text-red-600">{error}</p>
+          <p role="alert" className="mt-8 text-red-600">
+            {error}
+          </p>
         )}
 
         {!loading && !error && (
@@ -86,8 +110,13 @@ export default function ActivityLogsPage() {
                   key={label}
                   className="rounded-xl border bg-white p-5 shadow-sm"
                 >
-                  <p className="text-sm text-gray-500">{label}</p>
-                  <p className="mt-2 text-3xl font-bold">{value}</p>
+                  <p className="text-sm text-gray-500">
+                    {label}
+                  </p>
+
+                  <p className="mt-2 text-3xl font-bold">
+                    {value}
+                  </p>
                 </div>
               ))}
             </div>
@@ -105,7 +134,10 @@ export default function ActivityLogsPage() {
                       "Status",
                       "Timestamp",
                     ].map((heading) => (
-                      <th key={heading} className="p-4">
+                      <th
+                        key={heading}
+                        className="p-4 font-semibold"
+                      >
                         {heading}
                       </th>
                     ))}
@@ -121,10 +153,23 @@ export default function ActivityLogsPage() {
                       <td className="p-4 font-medium">
                         {log.action}
                       </td>
-                      <td className="p-4">{log.request_id}</td>
-                      <td className="p-4">{log.disaster_id}</td>
-                      <td className="p-4">{log.performed_by}</td>
-                      <td className="p-4">{log.description}</td>
+
+                      <td className="p-4">
+                        {log.request_id ?? "—"}
+                      </td>
+
+                      <td className="p-4">
+                        {log.disaster_id ?? "—"}
+                      </td>
+
+                      <td className="p-4">
+                        {log.performed_by}
+                      </td>
+
+                      <td className="p-4">
+                        {log.description}
+                      </td>
+
                       <td className="p-4">
                         <span
                           className={
@@ -136,13 +181,9 @@ export default function ActivityLogsPage() {
                           {log.status}
                         </span>
                       </td>
+
                       <td className="p-4">
-                        {log.timestamp
-                          ? new Date(log.timestamp).toLocaleString(
-                              "en-IN",
-                              { timeZone: "Asia/Kolkata" }
-                            )
-                          : "N/A"}
+                        {formatTimestamp(log.timestamp)}
                       </td>
                     </tr>
                   ))}

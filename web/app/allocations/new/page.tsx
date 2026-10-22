@@ -39,7 +39,7 @@ export default function CreateAllocationPage() {
 
     const confirmed = window.confirm(
       `Allocate available inventory to Request #${id}? ` +
-      "This will update your MySQL database."
+        "This will update your MySQL database."
     );
 
     if (!confirmed) return;
@@ -128,17 +128,17 @@ export default function CreateAllocationPage() {
 
             <p className="mt-2 text-sm text-slate-500">
               The system will allocate available stock for each
-              outstanding item in this request.
+              outstanding resource item.
             </p>
           </div>
 
           {error && (
-            <p
+            <div
               role="alert"
               className="mt-5 rounded-lg bg-red-50 p-4 text-red-700"
             >
               {error}
-            </p>
+            </div>
           )}
 
           {result && (
