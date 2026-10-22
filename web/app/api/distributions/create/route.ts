@@ -1,7 +1,9 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import type { ResultSetHeader, RowDataPacket } from "mysql2";
+
 import pool from "@/lib/mysql";
+import { requirePermission } from "@/lib/auth/permissions";
 
 interface AllocationRow extends RowDataPacket {
   Allocation_ID: number;
@@ -18,7 +20,7 @@ interface BeneficiaryRow extends RowDataPacket {
 
 interface QuantityRow extends RowDataPacket {
   Allocated_Quantity: number;
-  Total_Distributed: string | number;
+  Total_Distributed: number | string;
 }
 
 interface DistributionItem {
@@ -26,7 +28,7 @@ interface DistributionItem {
   quantity_distributed: number;
 }
 
-function validInteger(value: unknown): value is number {
+function validId(value: unknown): value is number {
   return (
     typeof value === "number" &&
     Number.isSafeInteger(value) &&
@@ -36,12 +38,20 @@ function validInteger(value: unknown): value is number {
 }
 
 export async function POST(request: NextRequest) {
-  // This route is for trusted local development only.
   if (process.env.NODE_ENV !== "development") {
     return NextResponse.json(
       { error: "Distribution recording is disabled in production." },
       { status: 403 }
     );
+  }
+
+  // Admin and Coordinator can record distributions.
+  const authorizationError = await requirePermission(
+    "record_distribution"
+  );
+
+  if (authorizationError) {
+    return authorizationError;
   }
 
   let body: unknown;
@@ -50,26 +60,29 @@ export async function POST(request: NextRequest) {
     body = await request.json();
   } catch {
     return NextResponse.json(
-      { error: "Invalid JSON input." },
+      { error: "Invalid JSON request." },
       { status: 400 }
     );
   }
 
-  if (!body || typeof body !== "object") {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
     return NextResponse.json(
-      { error: "Invalid request data." },
+      { error: "Invalid request body." },
       { status: 400 }
     );
   }
 
   const data = body as Record<string, unknown>;
 
+  const allocationId = data.allocation_id;
+  const beneficiaryId = data.beneficiary_id;
+
   if (
-    !validInteger(data.allocation_id) ||
-    !validInteger(data.beneficiary_id)
+    !validId(allocationId) ||
+    !validId(beneficiaryId)
   ) {
     return NextResponse.json(
-      { error: "Valid allocation and beneficiary IDs are required." },
+      { error: "Enter valid allocation and beneficiary IDs." },
       { status: 400 }
     );
   }
@@ -80,15 +93,20 @@ export async function POST(request: NextRequest) {
     data.items.length > 20
   ) {
     return NextResponse.json(
-      { error: "Provide between 1 and 20 distribution items." },
+      { error: "Enter between 1 and 20 distribution items." },
       { status: 400 }
     );
   }
 
-  const seenResources = new Set<number>();
+  const items: DistributionItem[] = [];
+  const seenResourceIds = new Set<number>();
 
   for (const rawItem of data.items) {
-    if (!rawItem || typeof rawItem !== "object") {
+    if (
+      !rawItem ||
+      typeof rawItem !== "object" ||
+      Array.isArray(rawItem)
+    ) {
       return NextResponse.json(
         { error: "Invalid distribution item." },
         { status: 400 }
@@ -98,28 +116,35 @@ export async function POST(request: NextRequest) {
     const item = rawItem as Record<string, unknown>;
 
     if (
-      !validInteger(item.resource_id) ||
-      !validInteger(item.quantity_distributed)
+      !validId(item.resource_id) ||
+      !validId(item.quantity_distributed)
     ) {
       return NextResponse.json(
-        { error: "Resource IDs and quantities must be positive integers." },
+        {
+          error:
+            "Resource IDs and distributed quantities must be positive integers.",
+        },
         { status: 400 }
       );
     }
 
-    if (seenResources.has(item.resource_id)) {
+    if (seenResourceIds.has(item.resource_id)) {
       return NextResponse.json(
-        { error: "Duplicate resource IDs are not allowed." },
+        { error: "Duplicate resources are not allowed." },
         { status: 400 }
       );
     }
 
-    seenResources.add(item.resource_id);
+    seenResourceIds.add(item.resource_id);
+
+    items.push({
+      resource_id: item.resource_id,
+      quantity_distributed: item.quantity_distributed,
+    });
   }
 
-  const allocationId = data.allocation_id as number;
-  const beneficiaryId = data.beneficiary_id as number;
-  const items = data.items as DistributionItem[];
+  // Check resources in a consistent order.
+  items.sort((a, b) => a.resource_id - b.resource_id);
 
   let connection;
 
@@ -127,14 +152,13 @@ export async function POST(request: NextRequest) {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // Lock the allocation to serialize distributions
-    // created through this API for the same allocation.
+    // Lock the allocation to serialize distribution submissions.
     const [allocations] = await connection.query<AllocationRow[]>(
       `SELECT
-          A.Allocation_ID,
-          A.Allocation_Status,
-          AR.Center_ID,
-          AR.Disaster_ID
+         A.Allocation_ID,
+         A.Allocation_Status,
+         AR.Center_ID,
+         AR.Disaster_ID
        FROM Allocation A
        JOIN Aid_Request AR
          ON A.Request_ID = AR.Request_ID
@@ -169,12 +193,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Verify that the beneficiary belongs to the same
+    // relief center and disaster as the allocation request.
     const [beneficiaries] =
       await connection.query<BeneficiaryRow[]>(
         `SELECT
-            Beneficiary_ID,
-            Center_ID,
-            Disaster_ID
+           Beneficiary_ID,
+           Center_ID,
+           Disaster_ID
          FROM Beneficiary
          WHERE Beneficiary_ID = ?`,
         [beneficiaryId]
@@ -200,36 +226,36 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(
         {
           error:
-            "Beneficiary does not belong to the allocation's relief center and disaster.",
+            "Beneficiary does not belong to this allocation's relief center and disaster.",
         },
         { status: 400 }
       );
     }
 
-    // Check remaining quantities across all distributions
-    // already recorded against this allocation.
+    // Verify that the total distributed amount cannot
+    // exceed the approved allocation.
     for (const item of items) {
-      const [rows] = await connection.query<QuantityRow[]>(
+      const [quantities] = await connection.query<QuantityRow[]>(
         `SELECT
-            AI.Allocated_Quantity,
-            COALESCE(
-              (
-                SELECT SUM(DI.Quantity_Distributed)
-                FROM Distribution D
-                JOIN Distribution_Item DI
-                  ON D.Distribution_ID = DI.Distribution_ID
-                WHERE D.Allocation_ID = AI.Allocation_ID
-                  AND DI.Resource_ID = AI.Resource_ID
-              ),
-              0
-            ) AS Total_Distributed
+           AI.Allocated_Quantity,
+           COALESCE(
+             (
+               SELECT SUM(DI.Quantity_Distributed)
+               FROM Distribution D
+               JOIN Distribution_Item DI
+                 ON D.Distribution_ID = DI.Distribution_ID
+               WHERE D.Allocation_ID = AI.Allocation_ID
+                 AND DI.Resource_ID = AI.Resource_ID
+             ),
+             0
+           ) AS Total_Distributed
          FROM Allocation_Item AI
          WHERE AI.Allocation_ID = ?
            AND AI.Resource_ID = ?`,
         [allocationId, item.resource_id]
       );
 
-      if (rows.length === 0) {
+      if (quantities.length === 0) {
         await connection.rollback();
 
         return NextResponse.json(
@@ -241,8 +267,14 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const allocated = Number(rows[0].Allocated_Quantity);
-      const alreadyDistributed = Number(rows[0].Total_Distributed);
+      const allocated = Number(
+        quantities[0].Allocated_Quantity
+      );
+
+      const alreadyDistributed = Number(
+        quantities[0].Total_Distributed
+      );
+
       const remaining = allocated - alreadyDistributed;
 
       if (item.quantity_distributed > remaining) {
@@ -258,8 +290,8 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Save the distribution header.
-    const [result] =
+    // Create the distribution header.
+    const [distributionResult] =
       await connection.execute<ResultSetHeader>(
         `INSERT INTO Distribution
            (Allocation_ID, Beneficiary_ID)
@@ -267,9 +299,9 @@ export async function POST(request: NextRequest) {
         [allocationId, beneficiaryId]
       );
 
-    const distributionId = result.insertId;
+    const distributionId = distributionResult.insertId;
 
-    // Save all resource items.
+    // Insert the distributed resource quantities.
     for (const item of items) {
       await connection.execute(
         `INSERT INTO Distribution_Item
@@ -287,6 +319,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // Inventory is NOT deducted here:
+    // it was already deducted during allocation.
     await connection.commit();
 
     return NextResponse.json(
