@@ -1,82 +1,108 @@
 
 import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
+import dotenv from "dotenv";
 import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
-import { createRequire } from "node:module";
+import { stdin, stdout } from "node:process";
 
-const require = createRequire(import.meta.url);
-require("dotenv").config({ path: ".env.local", quiet: true });
+dotenv.config({ path: ".env.local", quiet: true });
 
-const readline = createInterface({ input, output });
+// Role must be provided when running the script.
+const role = process.argv[2];
 
-function promptHidden(question) {
+if (role !== "Coordinator" && role !== "Viewer") {
+  console.error(
+    "Usage: node scripts/create-test-user.mjs Coordinator|Viewer"
+  );
+  process.exit(1);
+}
+
+const readline = createInterface({
+  input: stdin,
+  output: stdout,
+});
+
+function hiddenPassword(question) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    const wasRaw = Boolean(input.isRaw);
-
-    output.write(question);
-
-    input.setRawMode?.(true);
-    input.resume();
-
-    function cleanup() {
-      input.removeListener("data", onData);
-      input.setRawMode?.(wasRaw);
-      output.write("\n");
+    if (!stdin.isTTY || !stdin.setRawMode) {
+      reject(new Error("Run this script in an interactive Terminal."));
+      return;
     }
 
-    function onData(chunk) {
-      const bytes = Buffer.from(chunk);
+    let password = "";
 
-      for (const byte of bytes) {
-        if (byte === 3) {
-          cleanup();
-          reject(new Error("Cancelled"));
+    stdout.write(question);
+    stdin.setRawMode(true);
+    stdin.resume();
+
+    function finish() {
+      stdin.removeListener("data", handleInput);
+      stdin.setRawMode(false);
+      stdout.write("\n");
+    }
+
+    function handleInput(chunk) {
+      const characters = chunk.toString("utf8");
+
+      for (const character of characters) {
+        if (character === "\u0003") {
+          finish();
+          reject(new Error("Operation cancelled."));
           return;
         }
 
-        if (byte === 13 || byte === 10) {
-          cleanup();
-          resolve(Buffer.concat(chunks).toString("utf8"));
+        if (character === "\r" || character === "\n") {
+          finish();
+          resolve(password);
           return;
         }
 
-        if (byte === 127 || byte === 8) {
-          chunks.pop();
+        if (character === "\u007f" || character === "\b") {
+          password = password.slice(0, -1);
           continue;
         }
 
-        chunks.push(Buffer.from([byte]));
+        password += character;
       }
     }
 
-    input.on("data", onData);
+    stdin.on("data", handleInput);
   });
 }
 
 let connection;
 
 try {
-  const username = (await readline.question("Admin username: ")).trim();
+  console.log(`Creating a ${role} account`);
+
+  const username = (
+    await readline.question("Username: ")
+  ).trim();
 
   if (!/^[A-Za-z0-9_-]{3,50}$/.test(username)) {
     throw new Error(
-      "Username must be 3–50 letters, numbers, underscores or hyphens."
+      "Username must contain 3-50 letters, numbers, underscores or hyphens."
     );
   }
 
   readline.pause();
 
-  const password = await promptHidden("Admin password (hidden): ");
-  const confirmation = await promptHidden("Confirm password (hidden): ");
+  const password = await hiddenPassword(
+    "Password (hidden): "
+  );
 
-  if (password !== confirmation) {
+  const confirmPassword = await hiddenPassword(
+    "Confirm password (hidden): "
+  );
+
+  if (password !== confirmPassword) {
     throw new Error("Passwords do not match.");
   }
 
   if (password.length < 12) {
-    throw new Error("Use a password of at least 12 characters.");
+    throw new Error(
+      "Password must contain at least 12 characters."
+    );
   }
 
   connection = await mysql.createConnection({
@@ -87,29 +113,43 @@ try {
     database: process.env.DB_NAME,
   });
 
-  const [existing] = await connection.execute(
+  const [existingUsers] = await connection.execute(
     "SELECT User_ID FROM App_User WHERE Username = ?",
     [username]
   );
 
-  if (existing.length > 0) {
-    throw new Error("That username already exists.");
+  if (existingUsers.length > 0) {
+    throw new Error(
+      "This username already exists. Choose another username."
+    );
   }
 
-  const hash = await bcrypt.hash(password, 12);
+  // Store only the bcrypt password hash.
+  const passwordHash = await bcrypt.hash(password, 12);
 
+  // Use the selected role instead of hardcoding Admin.
   const [result] = await connection.execute(
     `INSERT INTO App_User
        (Username, Password_Hash, Role, Is_Active)
-     VALUES (?, ?, 'Admin', 1)`,
-    [username, hash]
+     VALUES (?, ?, ?, 1)`,
+    [username, passwordHash, role]
   );
 
-  console.log(`Admin account created. User ID: ${result.insertId}`);
+  console.log("\nAccount created successfully!");
+  console.log(`User ID: ${result.insertId}`);
+  console.log(`Username: ${username}`);
+  console.log(`Role: ${role}`);
+  console.log("Status: Active");
 } catch (error) {
-  console.error("Account creation failed:", error.message);
+  console.error(
+    "Account creation failed:",
+    error instanceof Error ? error.message : error
+  );
   process.exitCode = 1;
 } finally {
-  await connection?.end();
+  if (connection) {
+    await connection.end();
+  }
+
   readline.close();
 }

@@ -64,6 +64,13 @@ export default function FieldReportsPage() {
           Disaster Field Reports
         </h1>
 
+        <Link
+          href="/field-reports/new"
+          className="mt-5 inline-block rounded-lg bg-blue-600 px-5 py-3 font-semibold text-white hover:bg-blue-700"
+        >
+          + Submit New Field Report
+        </Link>
+
         <p className="mt-2 text-gray-600">
           Field observations retrieved from MongoDB Atlas.
         </p>

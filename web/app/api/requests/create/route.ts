@@ -3,13 +3,14 @@ import { NextRequest, NextResponse } from "next/server";
 import type { ResultSetHeader, RowDataPacket } from "mysql2";
 
 import pool from "@/lib/mysql";
+import { getSession } from "@/lib/auth/session";
 import { requirePermission } from "@/lib/auth/permissions";
+import { recordActivity } from "@/lib/activity-log";
 
 type Priority = "Low" | "Medium" | "High" | "Critical";
 
 interface CenterRow extends RowDataPacket {
   Center_ID: number;
-  Disaster_ID: number;
 }
 
 interface ExistingRow extends RowDataPacket {
@@ -31,7 +32,6 @@ function validId(value: unknown): value is number {
 }
 
 export async function POST(request: NextRequest) {
-  // Disable this prototype write endpoint in production.
   if (process.env.NODE_ENV !== "development") {
     return NextResponse.json(
       { error: "Aid request creation is disabled in production." },
@@ -39,13 +39,21 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Authorization must be INSIDE the POST function.
   const authorizationError = await requirePermission(
     "create_request"
   );
 
   if (authorizationError) {
     return authorizationError;
+  }
+
+  const session = await getSession();
+
+  if (!session) {
+    return NextResponse.json(
+      { error: "Please sign in." },
+      { status: 401 }
+    );
   }
 
   let body: unknown;
@@ -150,14 +158,16 @@ export async function POST(request: NextRequest) {
   }
 
   let connection;
+  let transactionCommitted = false;
 
   try {
     connection = await pool.getConnection();
     await connection.beginTransaction();
 
-    // Verify that the center exists and belongs to this disaster.
+    // Relief_Center does not contain Disaster_ID.
+    // Validate the center and disaster independently.
     const [centers] = await connection.query<CenterRow[]>(
-      `SELECT Center_ID, Disaster_ID
+      `SELECT Center_ID
        FROM Relief_Center
        WHERE Center_ID = ?`,
       [centerId]
@@ -165,23 +175,12 @@ export async function POST(request: NextRequest) {
 
     if (centers.length === 0) {
       await connection.rollback();
-
       return NextResponse.json(
         { error: "Relief center not found." },
         { status: 404 }
       );
     }
 
-    if (Number(centers[0].Disaster_ID) !== disasterId) {
-      await connection.rollback();
-
-      return NextResponse.json(
-        { error: "Relief center does not belong to this disaster." },
-        { status: 400 }
-      );
-    }
-
-    // Verify that the disaster exists.
     const [disasters] = await connection.query<RowDataPacket[]>(
       `SELECT Disaster_ID
        FROM Disaster
@@ -191,14 +190,12 @@ export async function POST(request: NextRequest) {
 
     if (disasters.length === 0) {
       await connection.rollback();
-
       return NextResponse.json(
         { error: "Disaster not found." },
         { status: 404 }
       );
     }
 
-    // Verify every resource exists before inserting the request.
     for (const item of items) {
       const [resources] = await connection.query<ExistingRow[]>(
         `SELECT Resource_ID
@@ -217,7 +214,6 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Insert the aid request.
     const [result] = await connection.execute<ResultSetHeader>(
       `INSERT INTO Aid_Request
          (Center_ID, Disaster_ID, Priority, Status)
@@ -227,7 +223,6 @@ export async function POST(request: NextRequest) {
 
     const requestId = result.insertId;
 
-    // Insert all requested resource items.
     for (const item of items) {
       await connection.execute(
         `INSERT INTO Request_Item
@@ -247,6 +242,18 @@ export async function POST(request: NextRequest) {
     }
 
     await connection.commit();
+    transactionCommitted = true;
+
+    const logged = await recordActivity({
+      action: "REQUEST_CREATED",
+      request_id: requestId,
+      disaster_id: disasterId,
+      performed_by: session.username,
+      description:
+        `Aid Request #${requestId} created for Center #${centerId} ` +
+        `with ${items.length} resource item(s). Priority: ${priority}.`,
+      status: "Success",
+    });
 
     return NextResponse.json(
       {
@@ -254,15 +261,16 @@ export async function POST(request: NextRequest) {
         request_id: requestId,
         status: "Pending",
         items_created: items.length,
+        activity_logged: logged,
       },
       { status: 201 }
     );
   } catch (error) {
-    if (connection) {
+    if (connection && !transactionCommitted) {
       try {
         await connection.rollback();
       } catch (rollbackError) {
-        console.error("Rollback error:", rollbackError);
+        console.error("Aid request rollback error:", rollbackError);
       }
     }
 

@@ -1,14 +1,26 @@
 
 import { NextResponse } from "next/server";
+
 import { getMongoDatabase } from "@/lib/mongodb";
+import { getSession } from "@/lib/auth/session";
 
 export async function GET() {
-  try {
-    const db = await getMongoDatabase();
+  const session = await getSession();
 
-    const logs = await db
+  if (!session) {
+    return NextResponse.json(
+      { error: "Please sign in to view activity logs." },
+      { status: 401 }
+    );
+  }
+
+  try {
+    const database = await getMongoDatabase();
+
+    const logs = await database
       .collection("activity_logs")
       .find({})
+      .sort({ timestamp: -1 })
       .limit(100)
       .toArray();
 
@@ -22,7 +34,7 @@ export async function GET() {
     console.error("Activity logs error:", error);
 
     return NextResponse.json(
-      { error: "Unable to fetch activity logs" },
+      { error: "Unable to fetch activity logs." },
       { status: 500 }
     );
   }
