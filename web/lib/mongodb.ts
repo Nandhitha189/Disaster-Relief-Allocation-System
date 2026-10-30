@@ -16,7 +16,8 @@ const client = new MongoClient(uri, {
     deprecationErrors: true,
   },
   maxPoolSize: 5,
-  serverSelectionTimeoutMS: 5000,
+  serverSelectionTimeoutMS: 20000,
+connectTimeoutMS: 10000,
 });
 
 const clientPromise = client.connect();
